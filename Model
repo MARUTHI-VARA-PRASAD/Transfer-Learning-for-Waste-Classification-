@@ -1,0 +1,331 @@
+# install and imports
+!pip install -q scikit-learn matplotlib seaborn plotly pillow
+import tensorflow as tf
+print("TF version:", tf.__version__)
+
+
+import os, zipfile
+from google.colab import files
+import tensorflow as tf
+from tensorflow.keras import layers
+from tensorflow.keras.applications import ResNet50
+from tensorflow.keras.applications.resnet50 import preprocess_input
+from tensorflow.keras.preprocessing import image_dataset_from_directory
+from sklearn.metrics import classification_report, confusion_matrix
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+import pandas as pd
+
+print("TF", tf.__version__)
+
+# 1.Upload & Extract your ZIP
+
+print("Upload your ZIP file (e.g., waste_dataset.zip).")
+uploaded = files.upload()  # choose your zip
+zip_name = list(uploaded.keys())[0]
+print("Uploaded:", zip_name)
+
+extract_dir = '/content/dataset'
+os.makedirs(extract_dir, exist_ok=True)
+with zipfile.ZipFile(zip_name, 'r') as z:
+    z.extractall(extract_dir)
+
+# Show top-level
+print("Top-level contents:", os.listdir(extract_dir))
+
+# 2. Auto-detect dataset folder containing classes
+
+expected_classes = set(['trash','plastic','paper','metal','glass','cardboard'])
+found = None
+
+for root, dirs, files in os.walk(extract_dir):
+    dirnames = set(dirs)
+    # lower-case names to be safe
+    if expected_classes.issubset({d.lower() for d in dirs}):
+        found = root
+        break
+
+if found is None:
+    # fallback: check one extra nested folder with identical name (common zip behavior)
+    # try depth 2
+    for top in os.listdir(extract_dir):
+        top_path = os.path.join(extract_dir, top)
+        if os.path.isdir(top_path):
+            for second in os.listdir(top_path):
+                second_path = os.path.join(top_path, second)
+                if os.path.isdir(second_path):
+                    if expected_classes.issubset({d.lower() for d in os.listdir(second_path)}):
+                        found = second_path
+                        break
+            if found: break
+
+if found is None:
+    print("WARNING: couldn't auto-detect folder with expected classes. Please inspect /content/dataset and set DATA_DIR manually.")
+    print("Contents:", list(os.walk(extract_dir))[:2])
+else:
+    DATA_DIR = found
+    print("Detected DATA_DIR:", DATA_DIR)
+    print("Classes inside:", sorted(os.listdir(DATA_DIR)))
+
+
+# 3. Quick sanity checks / count images per class
+
+if 'DATA_DIR' in globals():
+    counts = {}
+    for cl in sorted(os.listdir(DATA_DIR)):
+        cl_path = os.path.join(DATA_DIR, cl)
+        if os.path.isdir(cl_path):
+            files_list = [f for f in os.listdir(cl_path) if os.path.isfile(os.path.join(cl_path, f))]
+            counts[cl] = len(files_list)
+    df_counts = pd.DataFrame.from_dict(counts, orient='index', columns=['count']).sort_values('count', ascending=False)
+    display(df_counts)
+else:
+    raise SystemExit("DATA_DIR not found. Fix path and re-run.")
+
+
+# 4. Load dataset with tf.data
+
+IMG_SIZE = (224, 224)
+BATCH_SIZE = 32
+SEED = 42
+
+train_ds = image_dataset_from_directory(
+    DATA_DIR,
+    validation_split=0.2,
+    subset="training",
+    seed=SEED,
+    image_size=IMG_SIZE,
+    batch_size=BATCH_SIZE
+)
+val_ds = image_dataset_from_directory(
+    DATA_DIR,
+    validation_split=0.2,
+    subset="validation",
+    seed=SEED,
+    image_size=IMG_SIZE,
+    batch_size=BATCH_SIZE
+)
+
+class_names = train_ds.class_names
+NUM_CLASSES = len(class_names)
+print("Classes:", class_names)
+
+
+# 6. Build the ResNet50 transfer-learning model
+
+base_model = ResNet50(weights='imagenet', include_top=False, input_shape=(IMG_SIZE[0], IMG_SIZE[1], 3))
+base_model.trainable = False  # start with frozen base
+
+inputs = tf.keras.Input(shape=(IMG_SIZE[0], IMG_SIZE[1], 3))
+x = data_augmentation(inputs)
+x = preprocess_input(x)   # ResNet-specific preprocessing
+x = base_model(x, training=False)
+x = layers.GlobalAveragePooling2D()(x)
+x = layers.Dropout(0.3)(x)
+outputs = layers.Dense(NUM_CLASSES, activation='softmax')(x)
+
+model = tf.keras.Model(inputs, outputs)
+model.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=1e-4),
+              loss='sparse_categorical_crossentropy',
+              metrics=['accuracy'])
+model.summary()
+
+# 7. Train the head
+
+EPOCHS_HEAD = 8
+history_head = model.fit(train_ds, validation_data=val_ds, epochs=EPOCHS_HEAD)
+
+
+# 8. Fine-tuning: unfreeze top layers and train lower LR
+
+# Unfreeze last ~50 layers (tune based on your dataset size)
+base_model.trainable = True
+for layer in base_model.layers[:-50]:
+    layer.trainable = False
+
+model.compile(optimizer=tf.keras.optimizers.Adam(1e-5),
+              loss='sparse_categorical_crossentropy',
+              metrics=['accuracy'])
+
+EPOCHS_FINE = 6
+history_fine = model.fit(train_ds, validation_data=val_ds, epochs=EPOCHS_FINE)
+
+
+# 9. Plot training curves (head + fine-tune)
+
+def plot_hist(h, title=''):
+    plt.figure(figsize=(12,4))
+    plt.subplot(1,2,1)
+    plt.plot(h.history['loss'], label='train_loss')
+    if 'val_loss' in h.history:
+        plt.plot(h.history['val_loss'], label='val_loss')
+    plt.title('Loss '+title); plt.legend()
+
+    plt.subplot(1,2,2)
+    plt.plot(h.history['accuracy'], label='train_acc')
+    if 'val_accuracy' in h.history:
+        plt.plot(h.history['val_accuracy'], label='val_acc')
+    plt.title('Accuracy '+title); plt.legend()
+    plt.show()
+
+print("Head training:")
+plot_hist(history_head, '(head)')
+print("Fine-tune:")
+plot_hist(history_fine, '(fine-tune)')
+
+# 10. Evaluate on validation set (predictions, classification report, confusion matrix)
+
+val_images = []
+val_labels = []
+for batch_imgs, batch_labels in val_ds:
+    val_images.append(batch_imgs.numpy())
+    val_labels.append(batch_labels.numpy())
+val_images = np.vstack(val_images)
+val_labels = np.hstack(val_labels)
+
+preds = model.predict(val_images, batch_size=32)
+pred_classes = np.argmax(preds, axis=1)
+
+print("Classification Report:")
+print(classification_report(val_labels, pred_classes, target_names=class_names))
+
+cm = confusion_matrix(val_labels, pred_classes)
+plt.figure(figsize=(7,6))
+sns.heatmap(cm, annot=True, fmt='d', xticklabels=class_names, yticklabels=class_names)
+plt.xlabel('Predicted'); plt.ylabel('True'); plt.title('Confusion Matrix')
+plt.show()
+
+#Step 10.5
+
+from tensorflow.keras.preprocessing.image import ImageDataGenerator
+
+data_dir = "/content/dataset/Garbage classification/Garbage classification"
+
+# Image data generators
+train_datagen = ImageDataGenerator(
+    rescale=1./255,
+    validation_split=0.2,      # 80% train / 20% validation
+    shear_range=0.2,
+    zoom_range=0.2,
+    horizontal_flip=True
+)
+
+# Training generator
+train_generator = train_datagen.flow_from_directory(
+    data_dir,
+    target_size=(224, 224),
+    batch_size=32,
+    class_mode='categorical',
+    subset='training',
+    shuffle=True
+)
+
+# Validation generator
+val_generator = train_datagen.flow_from_directory(
+    data_dir,
+    target_size=(224, 224),
+    batch_size=32,
+    class_mode='categorical',
+    subset='validation',
+    shuffle=False
+)
+
+print("✅ Data generators created successfully!")
+print("Classes:", train_generator.class_indices)
+
+# ===========================================================
+# 11. Grad-CAM (explainability) - show one example per class
+# ===========================================================
+import numpy as np
+import tensorflow as tf
+import matplotlib.pyplot as plt
+import cv2
+from tensorflow.keras.preprocessing import image
+
+# -------------------------
+# Helper: Load & preprocess image
+# -------------------------
+def load_and_preprocess(img_path, target_size=(224, 224)):
+    img = image.load_img(img_path, target_size=target_size)
+    img_array = image.img_to_array(img)
+    img_array = np.expand_dims(img_array, axis=0)
+    img_array = tf.keras.applications.resnet50.preprocess_input(img_array)
+    return img_array, np.array(img)
+
+# -------------------------
+# Helper: Grad-CAM heatmap
+# -------------------------
+def make_gradcam_heatmap(img_array, model, last_conv_layer_name, pred_index=None):
+    base_model = model.get_layer("resnet50")
+    grad_model = tf.keras.models.Model(
+        [base_model.input],
+        [base_model.get_layer(last_conv_layer_name).output, base_model.output]
+    )
+
+    with tf.GradientTape() as tape:
+        conv_outputs, predictions = grad_model(img_array)
+        if pred_index is None:
+            pred_index = tf.argmax(predictions[0])
+        class_channel = predictions[:, pred_index]
+
+    grads = tape.gradient(class_channel, conv_outputs)
+    pooled_grads = tf.reduce_mean(grads, axis=(0, 1, 2))
+    conv_outputs = conv_outputs[0]
+
+    heatmap = tf.reduce_sum(tf.multiply(pooled_grads, conv_outputs), axis=-1)
+    heatmap = np.maximum(heatmap, 0) / tf.math.reduce_max(heatmap)
+    return heatmap.numpy()
+
+
+# Grad-CAM Visualization per class
+
+class_names = list(train_generator.class_indices.keys())
+last_conv_layer_name = "conv5_block3_out"
+
+fig, axes = plt.subplots(len(class_names), 2, figsize=(10, 4 * len(class_names)))
+
+for idx, cls in enumerate(class_names):
+    # Pick first image of this class from val_generator.filepaths
+    for img_path in val_generator.filepaths:
+        if f"/{cls}/" in img_path.replace("\\","/"):  # works for Windows or Linux paths
+            img_array, orig_img = load_and_preprocess(img_path)
+            orig_img = (orig_img).astype('uint8')
+            break
+
+    # Predict
+    preds = model.predict(img_array)
+    pred_idx = np.argmax(preds[0])
+    pred_label = class_names[pred_idx]
+    confidence = float(preds[0][pred_idx]) * 100
+
+    # Grad-CAM heatmap
+    heatmap = make_gradcam_heatmap(img_array, model, last_conv_layer_name, pred_index=pred_idx)
+
+    # Overlay heatmap
+    heatmap = cv2.resize(heatmap, (orig_img.shape[1], orig_img.shape[0]))
+    heatmap = np.uint8(255 * heatmap)
+    heatmap = cv2.applyColorMap(heatmap, cv2.COLORMAP_JET)
+    superimposed_img = cv2.addWeighted(orig_img, 0.6, heatmap, 0.4, 0)
+
+    # Plot
+    correct = pred_label == cls
+    color = "green" if correct else "red"
+
+    axes[idx, 0].imshow(orig_img)
+    axes[idx, 0].axis("off")
+    axes[idx, 0].set_title(f"True: {cls}", color="black", fontsize=12)
+
+    axes[idx, 1].imshow(superimposed_img[..., ::-1])
+    axes[idx, 1].axis("off")
+    axes[idx, 1].set_title(f"Pred: {pred_label} ({confidence:.1f}%)", color=color, fontsize=12)
+
+plt.tight_layout()
+plt.show()
+
+
+
+
+
+
+
